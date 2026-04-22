@@ -1,0 +1,12 @@
+[Unit]
+Description=BackupD
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/backupd
+ExecStart=/opt/backupd/.venv/bin/uvicorn main:app --host 192.168.254.253 --port 8080
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target

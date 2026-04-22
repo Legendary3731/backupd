@@ -1,0 +1,10 @@
+{
+  "defaults": {
+    "max_backups": 3,
+    "total_backups_size": 0,
+    "cooldown": 60,
+    "allowed_networks": ["192.168.254.0/24"]
+  },
+
+  "overrides": {}
+}
