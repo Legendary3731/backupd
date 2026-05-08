@@ -1,0 +1,442 @@
+#!/bin/bash
+
+API="http://192.168.254.253:8080"
+
+CRED_FILE="/etc/backupctl/credentials"
+
+
+# ==================================================
+# Dépendances minimales (auto-install silencieux)
+# ==================================================
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+install_packages_apt() {
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    -o Dpkg::Progress-Fancy=0 \
+    -o APT::Color=0 \
+    "$@" >/dev/null 2>&1
+}
+
+install_packages_apk() {
+  apk add --no-cache -q "$@" >/dev/null 2>&1
+}
+
+install_packages_dnf() {
+  dnf install -y -q --setopt=tsflags=nodocs "$@" >/dev/null 2>&1
+}
+
+install_packages_yum() {
+  yum install -y -q "$@" >/dev/null 2>&1
+}
+
+install_missing() {
+  local missing=("$@")
+
+  if require_cmd apt-get; then
+    install_packages_apt "${missing[@]}"
+
+  elif require_cmd apk; then
+    install_packages_apk "${missing[@]}"
+
+  elif require_cmd dnf; then
+    install_packages_dnf "${missing[@]}"
+
+  elif require_cmd yum; then
+    install_packages_yum "${missing[@]}"
+
+  else
+    echo "❌ Aucun gestionnaire supporté: ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+# Liste des commandes requises
+REQUIRED_CMDS=(curl openssl)
+
+MISSING_PKGS=()
+
+for cmd in "${REQUIRED_CMDS[@]}"; do
+  if ! require_cmd "$cmd"; then
+    MISSING_PKGS+=("$cmd")
+  fi
+done
+
+# Installer uniquement ce qui manque
+if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+  install_missing "${MISSING_PKGS[@]}"
+fi
+
+
+# =========================
+# API global
+# =========================
+
+
+[ -f "$CRED_FILE" ] || {
+  echo "❌ Fichier de clé manquant : $CRED_FILE" >&2
+  exit 1
+}
+
+# shellcheck disable=SC1090
+source "$CRED_FILE"
+
+[ -n "$XKEY" ] || {
+  echo "❌ Clé API absente (XKEY)" >&2
+  exit 1
+}
+
+KEY="$XKEY"
+
+
+die() {
+  echo "❌ $1" >&2
+  exit 1
+}
+
+success() {
+  echo "✅ $1"
+}
+
+confirm() {
+  read -r -p "$1 [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { echo "❎ Annulé."; exit 0; }
+}
+
+ts() {
+  date +%s
+}
+
+hmac() {
+  printf "%s" "$1" | openssl dgst -sha256 -hmac "$KEY" | awk '{print $2}'
+}
+
+# =========================
+# API helpers
+# =========================
+
+api_get() {
+  local url="$1"
+
+  response=$(curl -s \
+    -H "X-Key: $KEY" \
+    -w "\nHTTP_CODE:%{http_code}" \
+    "$url"
+  )
+
+  body="${response%$'\nHTTP_CODE:'*}"
+  code="${response##*HTTP_CODE:}"
+
+  API_BODY="$body"
+
+  case "$code" in
+    200)
+      printf "%s" "$body"
+      ;;
+    403)
+      if ! api_print_auth_error; then
+        echo "❌ Accès refusé (HTTP 403)" >&2
+      fi
+      return 1
+      ;;
+    *)
+      echo "❌ Erreur API (HTTP $code)" >&2
+      return 1
+      ;;
+  esac
+}
+
+signed_payload() {
+  local ts nonce sig backup_id
+  ts=$(ts)
+  nonce=$(openssl rand -hex 8)
+
+  if [ -n "$1" ]; then
+    backup_id="$1"
+    sig=$(hmac "timestamp=$ts&nonce=$nonce&backup_id=$backup_id")
+    printf '{"timestamp":%s,"nonce":"%s","signature":"%s","backup_id":"%s"}' \
+      "$ts" "$nonce" "$sig" "$backup_id"
+  else
+    sig=$(hmac "timestamp=$ts&nonce=$nonce")
+    printf '{"timestamp":%s,"nonce":"%s","signature":"%s"}' \
+      "$ts" "$nonce" "$sig"
+  fi
+}
+
+api_request() {
+  local method="$1"
+  local path="$2"
+  local payload="$3"
+  shift 3
+
+  response=$(curl -s \
+    -X "$method" \
+    -H "X-Key: $KEY" \
+    -H "Content-Type: application/json" \
+    ${payload:+-d "$payload"} \
+    "$@" \
+    -w "\nHTTP_CODE:%{http_code}" \
+    "$API$path"
+  )
+
+  API_CODE="${response##*HTTP_CODE:}"
+  API_BODY="${response%$'\nHTTP_CODE:'*}"
+
+  # garde-fou
+  [ -z "$API_CODE" ] && API_CODE=0
+}
+
+api_print_auth_error() {
+  [ -z "$API_BODY" ] && return 1
+
+  local reason
+  reason=$(printf '%s' "$API_BODY" | sed -n 's/.*"detail":"\([^"\]*\)".*/\1/p')
+  [ -n "$reason" ] || reason="$API_BODY"
+
+  case "$reason" in
+    missing\ key)
+      echo "❌ Clé manquante" >&2
+      ;;
+    invalid\ key)
+      echo "❌ Clé invalide" >&2
+      ;;
+    timestamp)
+      echo "❌ Timestamp invalide ou expiré" >&2
+      ;;
+    invalid\ ip)
+      echo "❌ IP invalide" >&2
+      ;;
+    network\ restricted)
+      echo "❌ Réseau non autorisé" >&2
+      ;;
+    replay)
+      echo "❌ Rejeu détecté (nonce déjà utilisé)" >&2
+      ;;
+    signature)
+      echo "❌ Signature invalide" >&2
+      ;;
+    *)
+      echo "❌ Accès refusé : $reason" >&2
+      ;;
+  esac
+
+  return 0
+}
+
+api_print_details() {
+  [ -z "$API_BODY" ] && return 1
+
+  local msg count max total_size total_limit remaining
+  msg=$(printf '%s' "$API_BODY" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+  count=$(printf '%s' "$API_BODY" | sed -n 's/.*"count":[[:space:]]*\([0-9]*\).*/\1/p')
+  max=$(printf '%s' "$API_BODY" | sed -n 's/.*"max_backups":[[:space:]]*\([0-9]*\).*/\1/p')
+  total_size=$(printf '%s' "$API_BODY" | sed -n 's/.*"total_size_mb":[[:space:]]*\([0-9.]*\).*/\1/p')
+  total_limit=$(printf '%s' "$API_BODY" | sed -n 's/.*"total_backups_size":[[:space:]]*\([0-9.]*\).*/\1/p')
+  remaining=$(printf '%s' "$API_BODY" | sed -n 's/.*"remaining_seconds":[[:space:]]*\([0-9]*\).*/\1/p')
+
+  [ -n "$msg" ] && echo "❌ $msg" >&2
+
+  if [ -n "$count" ] || [ -n "$total_size" ]; then
+    echo "Quota :" >&2
+  fi
+
+  if [ -n "$count" ]; then
+    if [ -n "$max" ] && [ "$max" -gt 0 ]; then
+      echo "   Backups : $count / $max" >&2
+    else
+      echo "   Backups : $count / ∞" >&2
+    fi
+  fi
+
+  if [ -n "$total_size" ]; then
+    if [ -n "$total_limit" ] && [ "$total_limit" -gt 0 ]; then
+      echo "   Taille  : ${total_size}MB / ${total_limit}MB" >&2
+    else
+      echo "   Taille  : ${total_size}MB / ∞" >&2
+    fi
+  fi
+
+  if [ -n "$remaining" ]; then
+    echo "   Cooldown : ${remaining}s" >&2
+  fi
+
+  return 0
+}
+
+# =========================
+# LIST / STATUS
+# =========================
+render_list() {
+  grep -o '"file": *"[^"]*", *"date": *[0-9.]*, *"size": *[0-9]*' | \
+  sed 's/"file": *"//; s/", *"date": *\([0-9.]*\), *"size": *\([0-9]*\)/|\1|\2/' | \
+  sort -t'|' -k2 -rn | \
+  awk -F'|' '
+{
+  cmd = "date -d @" int($2) " \"+%Y-%m-%d %H:%M\""
+  cmd | getline d
+  close(cmd)
+  lines[NR] = sprintf("%-3d  %-45s  %6.2f GiB  %s", NR, $1, $3/1024/1024/1024, d)
+  if (length(lines[NR]) > maxlen) maxlen = length(lines[NR])
+}
+END {
+  sep = ""
+  for (i = 0; i < maxlen; i++) sep = sep "-"
+
+  header = sprintf("%-3s  %-47s  %-8s  %s", "#", "FICHIER", "TAILLE", "DATE")
+  printf "\n%s\n%s\n", header, sep
+  for (i = 1; i <= NR; i++) print lines[i]
+  print ""
+}'
+}
+
+list_backups() {
+  json=$(api_get "$API/backups?timestamp=$(ts)") || exit 1
+  echo "$json" | render_list
+  API_BODY="$json" api_print_details
+}
+
+
+status() {
+  json=$(api_get "$API/backups/status?timestamp=$(ts)") || exit 1
+
+  echo "$json" | grep -q '"job":null' && {
+    echo "✅ Aucun job en cours"
+    exit 0
+  }
+
+  action=$(echo "$json" | sed -n 's/.*"action":"\([^"]*\)".*/\1/p')
+  started=$(echo "$json" | sed -n 's/.*"started":\([0-9]*\).*/\1/p')
+
+  echo "🔄 Job en cours"
+  echo " Action : $action"
+  echo " Début  : $(date -d "@$started" '+%Y-%m-%d %H:%M:%S')"
+}
+
+# =========================
+# SELECT / DELETE / RESTORE
+# =========================
+select_backup() {
+  json=$(api_get "$API/backups?timestamp=$(ts)") || return 1
+
+  list=$(echo "$json" | render_list)
+  printf '%s\n' "$list" >&2
+
+  read -r -p "Choisis un numéro: " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || return 1
+
+  selected=$(printf '%s\n' "$list" | grep -E '^[[:space:]]*[0-9]+' | sed -n "${idx}p" | awk '{$1=""; sub(/^ +/, ""); print $1}')
+
+  [ -n "$selected" ] || return 1
+  printf '%s' "$selected"
+}
+
+create_backup() {
+  payload=$(signed_payload)
+
+  api_request POST "/backups" "$payload"
+
+  case "$API_CODE" in
+    200) success "Backup demandé (job en file d’attente)" ;;
+    403)
+      if ! api_print_auth_error; then
+        die "Accès refusé (HTTP 403)"
+      fi
+      exit 1
+      ;;
+    409)
+      if ! api_print_details; then
+        die "Quota de backups atteint. Supprimez une backup avant."
+      fi
+      exit 1
+      ;;
+    429)
+      if ! api_print_details; then
+        die "Trop de requêtes. Veuillez réessayer plus tard."
+      fi
+      exit 1
+      ;;
+    *)   die "Échec création (HTTP $API_CODE)" ;;
+  esac
+}
+
+delete_backup() {
+  file=$(select_backup) || die "Sélection invalide"
+  confirm "⚠️ Supprimer définitivement \"$file\" ?"
+
+  payload=$(signed_payload "$file")
+  api_request DELETE "/backups/$file" "$payload"
+
+  case "$API_CODE" in
+    200) success "Backup demandé (job en file d’attente)" ;;
+    400) die "Fichier de sauvegarde invalide" ;;
+    403)
+      if ! api_print_auth_error; then
+        die "Accès refusé (HTTP 403)"
+      fi
+      exit 1
+      ;;
+    429) die "Trop de requêtes. Veuillez réessayer plus tard." ;;
+    *)   die "Échec suppression (HTTP $API_CODE)" ;;
+  esac
+}
+
+restore_backup() {
+  local file payload
+
+  file=$(select_backup) || die "Sélection invalide"
+
+  echo "⚠️ Cette opération VA DÉTRUIRE la CT/VM actuelle."
+  echo "⚠️ Toutes les données non sauvegardées seront perdues."
+  echo "⚠️ La machine sera arrêtée puis restaurée."
+  echo
+
+  confirm "Restaurer \"$file\" ?"
+
+  payload=$(signed_payload "$file")
+
+  # -L indispensable (307 sur FastAPI)
+  api_request POST "/backups/$file/restore" "$payload" -L
+
+  case "$API_CODE" in
+    200) 
+      echo
+      echo "✅ Restauration demandée : $file"
+      echo "ℹ️ La machine va être arrêtée/restaurée."
+      echo "ℹ️ Une déconnexion est possible dans les instants à venir."
+      echo
+
+      exit 0
+    ;;
+    400) die "Fichier de sauvegarde invalide" ;;
+    403)
+      if ! api_print_auth_error; then
+        die "Accès refusé (HTTP 403)"
+      fi
+      exit 1
+      ;;
+    429) die "Trop de requêtes. Veuillez réessayer plus tard." ;;
+    *)   die "Échec restauration (HTTP $API_CODE)" ;;
+  esac
+}
+
+# =========================
+# MAIN
+# =========================
+case "$1" in
+  list)    list_backups ;;
+  status)  status ;;
+  create)  create_backup ;;
+  delete)  delete_backup ;;
+  restore) restore_backup ;;
+  *)
+    echo "Usage:"
+    echo "  backupctl list"
+    echo "  backupctl status"
+    echo "  backupctl create"
+    echo "  backupctl delete"
+    echo "  backupctl restore"
+    exit 1 ;;
+esac
